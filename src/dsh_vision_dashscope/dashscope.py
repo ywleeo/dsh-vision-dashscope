@@ -279,7 +279,12 @@ async def submit_video(
     """提交视频生成任务，返回 task_id（不等待完成）。"""
     resp = await client.post(
         VIDEO_SYNTHESIS_ENDPOINT,
-        headers=_auth_headers(),
+        headers={
+            **_auth_headers(),
+            "X-DashScope-Async": "enable",
+            # 首帧/素材可能是 oss:// 临时 URL，需要模型服务端解析。
+            "X-DashScope-OssResourceResolve": "enable",
+        },
         json=payload,
         timeout=httpx.Timeout(60.0, connect=30.0),
     )
@@ -410,6 +415,7 @@ async def transcribe_asr(
     headers = _auth_headers()
     if audio_url.startswith("oss://"):
         headers["X-DashScope-OssResourceResolve"] = "enable"
+    headers["X-DashScope-Async"] = "enable"
     resp = await client.post(
         f"{config.native_base()}/api/v1/services/audio/asr/transcription",
         headers=headers,
