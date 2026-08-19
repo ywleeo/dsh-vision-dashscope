@@ -251,11 +251,24 @@ async def generate_image(
         )
         output_dir = config.generation_output_dir()
         saved = []
+        previews = []
         for index, url in enumerate(urls):
-            ext = ".png"
-            target = await dashscope.download_to(client, url, output_dir, f"t2i-{index}-{int(time.time())}{ext}")
+            target = await dashscope.download_to(client, url, output_dir, f"t2i-{index}-{int(time.time())}.png")
             saved.append(str(target))
-    return {"status": "SUCCEEDED", "files": saved, "cost": cost}
+            if config.image_preview_jpeg_enabled():
+                preview = dashscope.make_jpeg_preview(
+                    target,
+                    output_dir,
+                    max_dim=config.image_preview_max_dim(),
+                    quality=config.image_preview_quality(),
+                )
+                if preview is not None:
+                    previews.append(str(preview))
+    result: dict = {"status": "SUCCEEDED", "files": saved, "cost": cost}
+    if previews:
+        result["preview"] = previews[0]
+        result["note"] = "preview 为 JPEG 预览（原图在 files 中）；对话内联显示请用 preview 路径。"
+    return result
 
 
 async def _run_video_generation(

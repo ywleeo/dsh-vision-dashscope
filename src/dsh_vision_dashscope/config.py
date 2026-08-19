@@ -160,3 +160,15 @@ def generation_output_dir() -> Path:
 
 def max_video_duration() -> int:
     return _env_int("DASH_VISION_MAX_VIDEO_DURATION", 10)
+
+
+def image_preview_jpeg_enabled() -> bool:
+    return os.environ.get("DASH_VISION_IMAGE_PREVIEW_JPEG", "1").strip().lower() not in {"0", "false", "no", "off"}
+
+
+def image_preview_max_dim() -> int:
+    return _env_int("DASH_VISION_IMAGE_PREVIEW_MAX_DIM", 1600)
+
+
+def image_preview_quality() -> int:
+    return _env_int("DASH_VISION_IMAGE_PREVIEW_QUALITY", 85)

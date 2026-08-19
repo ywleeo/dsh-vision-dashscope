@@ -359,6 +359,39 @@ async def download_to(
     return target
 
 
+def make_jpeg_preview(
+    source: Path,
+    output_dir: Path,
+    *,
+    max_dim: int = 1600,
+    quality: int = 85,
+) -> Path | None:
+    """把图片转出一张 JPEG 预览（保留原图），用于对话内联显示。
+
+    仅对非 JPEG 的图片生成；分辨率按最长边缩到 max_dim 内、质量 quality，
+    保证体积远小于 DSH 的图片读取上限（5MB）。返回预览路径；输入已是
+    JPEG 或转换失败时返回 None（不覆盖原图）。
+    """
+    if source.suffix.lower() in {".jpg", ".jpeg"}:
+        return None
+    try:
+        from PIL import Image
+
+        with Image.open(source) as im:
+            im.load()
+            if im.mode not in {"RGB", "L"}:
+                im = im.convert("RGB")
+            if max(im.size) > max_dim:
+                im.thumbnail((max_dim, max_dim))
+            output_dir.mkdir(parents=True, exist_ok=True)
+            preview = output_dir / f"{source.stem}.jpg"
+            im.save(preview, "JPEG", quality=quality, optimize=True)
+            return preview
+    except Exception as exc:  # 转换失败不影响主流程
+        print(f"[dsh-vision-dashscope] JPEG 预览生成失败（{source.name}）：{exc}", file=__import__("sys").stderr)
+        return None
+
+
 # ---- ASR（长音频转写，fun-asr 异步任务） ----
 
 async def transcribe_asr(

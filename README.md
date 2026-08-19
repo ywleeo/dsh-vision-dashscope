@@ -21,6 +21,7 @@
 - 识别工具会调用 DashScope 付费 API（按 token 计费，量小价低）。
 - **生成工具必须 `confirm=true` 才会实际调用付费接口**；`false` 时只返回预计费用（如"预计 3.00 元（5 秒 × 0.6 元/秒）"）。
 - 生成结果自动下载到本地输出目录（默认 `~/Downloads/dsh-vision-dashscope`，可用 `DASH_VISION_OUTPUT_DIR` 修改），返回本地路径——配合 dsh-image-preview 可直接在对话里内联预览。
+- 文生图默认**额外转一张 JPEG 预览**（`preview` 字段，最长边 1600px / 质量 85，可配），原始 PNG 保留在 `files` 中——DSH 图片内联上限 5MB，大 PNG（1792×2400 可达 7MB）直接内联会 404，用 JPEG 预览即可正常显示。
 
 ## 安装
 
