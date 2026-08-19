@@ -21,6 +21,20 @@ def test_tools_registered(tools):
     assert "recognize_video" in tools
     assert "recognize_audio" in tools
     assert "dashscope_status" in tools
+    assert "generate_image" in tools
+    assert "generate_video" in tools
+    assert "generate_video_from_image" in tools
+
+
+def test_generation_config_defaults():
+    from dsh_vision_dashscope import config
+
+    assert config.image_generation_model() == "qwen-image-3.0"
+    assert config.image_generation_model("pro") == "wan2.7-image-pro"
+    assert config.video_generation_model() == "wan2.7-t2v"
+    assert config.video_generation_model("standard", "i2v") == "wan2.7-i2v"
+    assert config.video_generation_model("max") == "happyhorse-1.1-t2v"
+    assert config.max_video_duration() >= 5
 
 
 def test_config_defaults():

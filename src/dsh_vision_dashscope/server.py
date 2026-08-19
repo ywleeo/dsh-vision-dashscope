@@ -13,6 +13,7 @@ openWorldHint=True，由客户端决定是否确认。
 
 from __future__ import annotations
 
+import time
 from typing import Annotated
 
 import httpx
@@ -205,5 +206,179 @@ async def dashscope_status() -> str:
         f"超出走临时 OSS 直传）\n"
         f"- 音频理解模型：{config.audio_model()}（≤{config.audio_omni_max_sec()}s）\n"
         f"- 长音频 ASR 模型：{config.asr_model()}\n"
+        f"- 图片生成：{config.image_generation_model()}（{config.IMAGE_GEN_PRICES['standard']} 元/张起）\n"
+        f"- 视频生成：{config.video_generation_model()}（{config.VIDEO_GEN_PRICES['standard']} 元/秒起）\n"
+        f"- 生成输出目录：{config.generation_output_dir()}\n"
         f"- API 端点：{config.api_base()}"
+    )
+
+
+# ---- 生成工具（付费接口，必须 confirm=true 才实际调用） ----
+
+
+@mcp.tool(
+    name="generate_image",
+    annotations=EXTERNAL_SEND_ANNOTATIONS,
+)
+async def generate_image(
+    prompt: Annotated[str, Field(description="图片内容描述。")],
+    tier: Annotated[
+        str,
+        Field(description="档位：standard(qwen-image-3.0)/pro(wan2.7-image-pro)/max(qwen-image-3.0-pro)，默认 standard。"),
+    ] = "standard",
+    size: Annotated[
+        str | None,
+        Field(description="尺寸，如 1024*1024（qwen-image 支持像素）或档位 1K/2K/4K；默认由模型决定。"),
+    ] = None,
+    confirm: Annotated[
+        bool,
+        Field(description="必须为 true 才会实际调用付费生成接口；false 时只返回预计费用。"),
+    ] = False,
+) -> dict:
+    """文生图。生成结果下载到本地输出目录并返回路径（配合 dsh-image-preview 可内联预览）。"""
+    tier = tier if tier in config.IMAGE_GEN_MODELS else "standard"
+    price = config.IMAGE_GEN_PRICES[tier]
+    cost = f"预计 {price} 元/张（{tier} 档）"
+    if not confirm:
+        return {"status": "NEEDS_CONFIRMATION", "cost": cost, "note": "设置 confirm=true 后才会实际调用付费生成接口。"}
+    model = config.image_generation_model(tier)
+    async with httpx.AsyncClient() as client:
+        urls = await dashscope.generate_image_t2i(
+            client,
+            model=model,
+            prompt=prompt.strip(),
+            size=size,
+        )
+        output_dir = config.generation_output_dir()
+        saved = []
+        for index, url in enumerate(urls):
+            ext = ".png"
+            target = await dashscope.download_to(client, url, output_dir, f"t2i-{index}-{int(time.time())}{ext}")
+            saved.append(str(target))
+    return {"status": "SUCCEEDED", "files": saved, "cost": cost}
+
+
+async def _run_video_generation(
+    *,
+    prompt: str,
+    duration: int,
+    resolution: str,
+    tier: str,
+    wait: bool,
+    kind: str,
+    image: str | None = None,
+) -> dict:
+    tier = tier if tier in config.VIDEO_GEN_MODELS_T2V else "standard"
+    if duration < 1 or duration > config.max_video_duration():
+        raise ValueError(f"视频时长 {duration}s 超出上限 {config.max_video_duration()}s")
+    if resolution not in {"480P", "720P", "1080P"}:
+        resolution = "720P"
+    if resolution == "480P":
+        resolution = "720P"
+    prices = config.I2V_GEN_PRICES if kind == "i2v" else config.VIDEO_GEN_PRICES
+    price = prices[tier]
+    cost = f"预计 {price * duration:.2f} 元（{duration} 秒 × {price} 元/秒）"
+
+    model = config.video_generation_model(tier, kind)
+    parameters = {
+        "duration": duration,
+        "resolution": resolution,
+        "prompt_extend": True,
+        "watermark": False,
+    }
+    async with httpx.AsyncClient() as client:
+        if kind == "i2v":
+            if image is None:
+                raise ValueError("图生视频需要提供首帧图片 image")
+            if dashscope.is_remote_url(image) or image.startswith("oss://"):
+                media_url = image
+            else:
+                media_url = await dashscope.upload_temp_oss(client, model, image)
+            payload = {
+                "model": model,
+                "input": {"prompt": prompt.strip(), "media": [{"type": "first_frame", "url": media_url}]},
+                "parameters": parameters,
+            }
+        else:
+            payload = {
+                "model": model,
+                "input": {"prompt": prompt.strip()},
+                "parameters": parameters,
+            }
+        if not wait:
+            task_id = await dashscope.submit_video(client, payload=payload)
+            return {"status": "PENDING", "task_id": task_id, "cost": cost}
+        output = await dashscope.submit_video_task(client, payload=payload)
+        video_url = dashscope.video_result_url(output)
+        if not video_url:
+            raise RuntimeError(f"视频任务成功但缺少结果 URL：{str(output)[:300]}")
+        target = await dashscope.download_to(
+            client,
+            video_url,
+            config.generation_output_dir(),
+            f"{'i2v' if kind == 'i2v' else 't2v'}-{int(time.time())}.mp4",
+        )
+        return {"status": "SUCCEEDED", "files": [str(target)], "cost": cost}
+
+
+@mcp.tool(
+    name="generate_video",
+    annotations=EXTERNAL_SEND_ANNOTATIONS,
+)
+async def generate_video(
+    prompt: Annotated[str, Field(description="视频内容描述。")],
+    tier: Annotated[
+        str,
+        Field(description="档位：standard(wan2.7-t2v)/pro(wan2.7-t2v 1080P)/max(happyhorse-1.1-t2v)，默认 standard。"),
+    ] = "standard",
+    duration: Annotated[int, Field(description="秒数", default=5)] = 5,
+    resolution: Annotated[str, Field(description="720P/1080P；480P 自动升级为 720P", default="720P")] = "720P",
+    wait: Annotated[
+        bool, Field(description="true=等待完成并下载；false=提交后返回 task_id", default=True)
+    ] = True,
+    confirm: Annotated[
+        bool,
+        Field(description="必须为 true 才会实际调用付费生成接口；false 时只返回预计费用。"),
+    ] = False,
+) -> dict:
+    """文生视频。生成结果下载到本地输出目录并返回路径。"""
+    tier = tier if tier in config.VIDEO_GEN_MODELS_T2V else "standard"
+    price = config.VIDEO_GEN_PRICES[tier]
+    cost = f"预计 {price * duration:.2f} 元（{duration} 秒 × {price} 元/秒）"
+    if not confirm:
+        return {"status": "NEEDS_CONFIRMATION", "cost": cost, "note": "设置 confirm=true 后才会实际调用付费生成接口。"}
+    return await _run_video_generation(
+        prompt=prompt, duration=duration, resolution=resolution, tier=tier, wait=wait, kind="t2v"
+    )
+
+
+@mcp.tool(
+    name="generate_video_from_image",
+    annotations=EXTERNAL_SEND_ANNOTATIONS,
+)
+async def generate_video_from_image(
+    image: Annotated[str, Field(description="首帧图片路径或 URL（本地图片自动上传到临时 OSS）。")],
+    prompt: Annotated[str, Field(description="视频内容描述。")],
+    tier: Annotated[
+        str,
+        Field(description="档位：standard(wan2.7-i2v)/max(happyhorse-1.1-i2v)，默认 standard。"),
+    ] = "standard",
+    duration: Annotated[int, Field(description="秒数", default=5)] = 5,
+    resolution: Annotated[str, Field(description="720P/1080P；480P 自动升级为 720P", default="720P")] = "720P",
+    wait: Annotated[
+        bool, Field(description="true=等待完成并下载；false=提交后返回 task_id", default=True)
+    ] = True,
+    confirm: Annotated[
+        bool,
+        Field(description="必须为 true 才会实际调用付费生成接口；false 时只返回预计费用。"),
+    ] = False,
+) -> dict:
+    """图生视频：以图片为首帧生成视频。"""
+    tier = tier if tier in config.VIDEO_GEN_MODELS_I2V else "standard"
+    price = config.I2V_GEN_PRICES[tier]
+    cost = f"预计 {price * duration:.2f} 元（{duration} 秒 × {price} 元/秒）"
+    if not confirm:
+        return {"status": "NEEDS_CONFIRMATION", "cost": cost, "note": "设置 confirm=true 后才会实际调用付费生成接口。"}
+    return await _run_video_generation(
+        prompt=prompt, duration=duration, resolution=resolution, tier=tier, wait=wait, kind="i2v", image=image
     )

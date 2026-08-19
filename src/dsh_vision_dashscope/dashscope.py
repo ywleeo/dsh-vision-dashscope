@@ -226,8 +226,140 @@ def _audio_format(url: str) -> str:
     }.get(suffix, "mp3")
 
 
-# ---- ASR（长音频转写，fun-asr 异步任务） ----
+# ---- 生成：图片（multimodal-generation，同步） ----
 
+GENERATION_ENDPOINT = "https://dashscope.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation"
+VIDEO_SYNTHESIS_ENDPOINT = "https://dashscope.aliyuncs.com/api/v1/services/aigc/video-generation/video-synthesis"
+
+
+async def generate_image_t2i(
+    client: httpx.AsyncClient,
+    *,
+    model: str,
+    prompt: str,
+    size: str | None = None,
+    n: int = 1,
+) -> list[str]:
+    """文生图（qwen-image / wan2.7-image）：Chat 格式、同步返回图片 URL 列表。"""
+    payload = {
+        "model": model,
+        "input": {"messages": [{"role": "user", "content": [{"text": prompt}]}]},
+        "parameters": {"n": max(1, min(n, 4)), "watermark": False},
+    }
+    if size:
+        payload["parameters"]["size"] = size
+    resp = await client.post(
+        GENERATION_ENDPOINT,
+        headers=_auth_headers(),
+        json=payload,
+        timeout=httpx.Timeout(180.0, connect=30.0),
+    )
+    if resp.status_code >= 400:
+        raise RuntimeError(f"文生图失败（HTTP {resp.status_code}）：{resp.text[:300]}")
+    urls: list[str] = []
+    for choice in resp.json().get("output", {}).get("choices", []):
+        content = (choice.get("message") or {}).get("content") or []
+        for item in content:
+            image = item.get("image") if isinstance(item, dict) else None
+            if isinstance(image, str) and image:
+                urls.append(image)
+    if not urls:
+        raise RuntimeError(f"文生图成功但响应中没有图片：{resp.text[:300]}")
+    return urls
+
+
+# ---- 生成：视频（异步任务：提交 -> 轮询） ----
+
+
+async def submit_video(
+    client: httpx.AsyncClient,
+    *,
+    payload: dict,
+) -> str:
+    """提交视频生成任务，返回 task_id（不等待完成）。"""
+    resp = await client.post(
+        VIDEO_SYNTHESIS_ENDPOINT,
+        headers=_auth_headers(),
+        json=payload,
+        timeout=httpx.Timeout(60.0, connect=30.0),
+    )
+    if resp.status_code >= 400:
+        raise RuntimeError(f"视频任务提交失败（HTTP {resp.status_code}）：{resp.text[:300]}")
+    task_id = resp.json().get("output", {}).get("task_id")
+    if not task_id:
+        raise RuntimeError(f"视频任务提交异常：{resp.text[:300]}")
+    return task_id
+
+
+async def submit_video_task(
+    client: httpx.AsyncClient,
+    *,
+    payload: dict,
+    poll_interval: int = 15,
+    timeout_sec: int = 1800,
+) -> dict:
+    """提交视频生成任务并轮询直到完成，返回任务 output。"""
+    task_id = await submit_video(client, payload=payload)
+    deadline = time.monotonic() + timeout_sec
+    while time.monotonic() < deadline:
+        await asyncio.sleep(poll_interval)
+        status_resp = await client.get(
+            f"{config.native_base()}/api/v1/tasks/{task_id}",
+            headers=_auth_headers(),
+            timeout=httpx.Timeout(30.0),
+        )
+        if status_resp.status_code >= 400:
+            raise RuntimeError(f"视频任务查询失败（HTTP {status_resp.status_code}）：{status_resp.text[:200]}")
+        output = status_resp.json().get("output", {})
+        state = output.get("task_status")
+        if state == "SUCCEEDED":
+            return output
+        if state in {"FAILED", "CANCELED"}:
+            raise RuntimeError(f"视频任务{state}：{str(output)[:300]}")
+    raise TimeoutError(f"视频任务超时（{timeout_sec}s）")
+
+
+def video_result_url(output: dict) -> str | None:
+    """从视频任务 output 中提取结果 URL。"""
+    direct = output.get("video_url")
+    if isinstance(direct, str) and direct:
+        return direct
+    results = output.get("results")
+    if isinstance(results, list) and results:
+        first = results[0]
+        if isinstance(first, dict):
+            return first.get("url") or first.get("video_url")
+    return None
+
+
+# ---- 生成：下载结果到本地 ----
+
+
+def sanitize_filename(name: str) -> str:
+    return "".join(c if (c.isalnum() or c in "-_.") else "_" for c in name).strip("._") or "output"
+
+
+async def download_to(
+    client: httpx.AsyncClient,
+    url: str,
+    output_dir: Path,
+    filename: str,
+) -> Path:
+    """下载生成结果到本地目录（目录自动创建）。"""
+    output_dir.mkdir(parents=True, exist_ok=True)
+    resp = await client.get(
+        url,
+        timeout=httpx.Timeout(600.0, connect=30.0),
+        follow_redirects=True,
+    )
+    if resp.status_code >= 400:
+        raise RuntimeError(f"下载结果失败（HTTP {resp.status_code}）：{url[:120]}")
+    target = output_dir / sanitize_filename(filename)
+    target.write_bytes(resp.content)
+    return target
+
+
+# ---- ASR（长音频转写，fun-asr 异步任务） ----
 
 async def transcribe_asr(
     client: httpx.AsyncClient,

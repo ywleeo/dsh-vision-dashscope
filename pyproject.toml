@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "dsh-vision-dashscope"
-version = "0.1.0"
+version = "0.2.0"
 description = "DSH 插件：通过 DashScope/Qwen 识别图片、视频、音频，大视频走临时 OSS 直传（无 base64 大小限制、不压缩画质）。"
 readme = "README.md"
 requires-python = ">=3.12"

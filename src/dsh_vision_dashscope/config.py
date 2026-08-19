@@ -123,3 +123,40 @@ def audio_base64_max_bytes() -> int:
 
 def max_tokens() -> int:
     return _env_int("DASH_VISION_MAX_TOKENS", 4096)
+
+
+# ---- 生成相关 ----
+
+IMAGE_GEN_MODELS = {
+    "standard": "qwen-image-3.0",
+    "pro": "wan2.7-image-pro",
+    "max": "qwen-image-3.0-pro",
+}
+# 每张图片参考价（元）。
+IMAGE_GEN_PRICES = {"standard": 0.18, "pro": 0.50, "max": 0.25}
+
+VIDEO_GEN_MODELS_T2V = {"standard": "wan2.7-t2v", "pro": "wan2.7-t2v", "max": "happyhorse-1.1-t2v"}
+VIDEO_GEN_MODELS_I2V = {"standard": "wan2.7-i2v", "pro": "wan2.7-i2v", "max": "happyhorse-1.1-i2v"}
+# 每秒参考价（元）。
+VIDEO_GEN_PRICES = {"standard": 0.60, "pro": 1.00, "max": 1.20}
+I2V_GEN_PRICES = {"standard": 0.60, "pro": 0.90, "max": 1.20}
+
+
+def image_generation_model(tier: str = "standard") -> str:
+    tier = tier if tier in IMAGE_GEN_MODELS else "standard"
+    return _env(f"DASH_VISION_IMAGE_GEN_MODEL_{tier.upper()}", IMAGE_GEN_MODELS[tier])
+
+
+def video_generation_model(tier: str = "standard", kind: str = "t2v") -> str:
+    tier = tier if tier in VIDEO_GEN_MODELS_T2V else "standard"
+    table = VIDEO_GEN_MODELS_I2V if kind == "i2v" else VIDEO_GEN_MODELS_T2V
+    return _env(f"DASH_VISION_VIDEO_GEN_MODEL_{tier.upper()}_{'I2V' if kind == 'i2v' else 'T2V'}", table[tier])
+
+
+def generation_output_dir() -> Path:
+    default = str(Path.home() / "Downloads" / "dsh-vision-dashscope")
+    return Path(_env("DASH_VISION_OUTPUT_DIR", default)).expanduser()
+
+
+def max_video_duration() -> int:
+    return _env_int("DASH_VISION_MAX_VIDEO_DURATION", 10)
