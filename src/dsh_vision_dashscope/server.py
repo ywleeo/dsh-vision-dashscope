@@ -13,11 +13,13 @@ openWorldHint=True，由客户端决定是否确认。
 
 from __future__ import annotations
 
+import asyncio
 import time
+from collections.abc import Coroutine
 from typing import Annotated
 
 import httpx
-from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp import Context, FastMCP
 from mcp.types import ToolAnnotations
 from pydantic import Field
 
@@ -32,6 +34,43 @@ EXTERNAL_SEND_ANNOTATIONS = ToolAnnotations(
     openWorldHint=True,
     destructiveHint=False,
 )
+
+# 长任务进度心跳：DSH 的 MCP client 对单次工具调用默认用「闲置超时」
+# （toolCallTimeoutMs，默认 60s），只在收到进度通知时重置。生图/生视频/识别
+# 都是等百炼返回（可能是单个同步 HTTP 请求，中间并无流式进度），若不主动
+# 上报，调用会在这个闲置窗口内被客户端掐断。这里用一个并发心跳任务，在等待
+# 主协程完成的全程每隔 heartbeat_interval 秒上报一次进度，重置客户端计时器。
+#
+# 注意 report_progress 只有在客户端携带 progressToken 时才真正发出通知；
+# 客户端没带（如纯命令行）时是 no-op，不影响其它行为。
+async def _heartbeat_t[T](
+    ctx: Context,
+    coro: Coroutine[None, None, T],
+    *,
+    heartbeat_interval: float = 10.0,
+    label: str = "任务进行中",
+) -> T:
+    """并发执行 ``coro``，同时周期性向客户端上报进度，避免闲置超时。"""
+
+    async def _beats() -> None:
+        while True:
+            await asyncio.sleep(heartbeat_interval)
+            try:
+                await ctx.report_progress(0, 100, label)
+            except Exception:
+                # 上报失败（如连接已断开）不影响主任务收敛，直接忽略。
+                pass
+
+    beats = asyncio.create_task(_beats())
+    try:
+        return await coro
+    finally:
+        beats.cancel()
+        try:
+            await beats
+        except asyncio.CancelledError:
+            pass
+
 
 mcp = FastMCP("dsh-vision-dashscope")
 
@@ -50,6 +89,7 @@ async def recognize_image(
         str,
         Field(description="识别档位：quick/standard/full/quick_analysis/balanced_analysis/deep_analysis，默认 standard。"),
     ] = "standard",
+    ctx: Context | None = None,
 ) -> str:
     """识别本地图片或图片 URL，按 task 调用千问多模态模型。"""
     del mode  # 保留参数位：后续可接 thinking/分辨率策略
@@ -63,13 +103,16 @@ async def recognize_image(
                 raise FileNotFoundError(f"找不到图片：{local}")
             item = {"type": "image_url", "image_url": {"url": dashscope.data_url(str(local))}}
             oss = False
-        return await dashscope.chat_media(
+        call = dashscope.chat_media(
             client,
             model=config.image_model(),
             task=task.strip() or DEFAULT_IMAGE_TASK,
             content_items=[item],
             oss_resolve=oss,
         )
+        if ctx is not None:
+            return await _heartbeat_t(ctx, call, label="图片识别中")
+        return await call
 
 
 @mcp.tool(
@@ -90,6 +133,7 @@ async def recognize_video(
         float | None,
         Field(description="抽帧频率（每秒帧数，0.1~10，默认 2.0）；画面运动快可调高。"),
     ] = None,
+    ctx: Context | None = None,
 ) -> str:
     """识别本地视频或视频 URL。
 
@@ -112,7 +156,7 @@ async def recognize_video(
             else:
                 item = {"type": "video_url", "video_url": {"url": dashscope.data_url(str(local))}}
                 oss = False
-        return await dashscope.chat_media(
+        call = dashscope.chat_media(
             client,
             model=config.video_model(),
             task=task.strip() or DEFAULT_VIDEO_TASK,
@@ -120,6 +164,9 @@ async def recognize_video(
             oss_resolve=oss,
             fps=fps,
         )
+        if ctx is not None:
+            return await _heartbeat_t(ctx, call, label="视频识别中")
+        return await call
 
 
 @mcp.tool(
@@ -136,6 +183,7 @@ async def recognize_audio(
         str,
         Field(description="长音频转写时的语言提示（zh/en/ja/yue/ko/de/fr/ru），默认 zh。"),
     ] = "zh",
+    ctx: Context | None = None,
 ) -> str:
     """识别本地音频或音频 URL。
 
@@ -162,19 +210,25 @@ async def recognize_audio(
                 audio_url = await dashscope.upload_temp_oss(client, config.asr_model(), str(local))
             else:
                 audio_url = url
-            return await dashscope.transcribe_asr(client, audio_url=audio_url, language=language)
+            call = dashscope.transcribe_asr(client, audio_url=audio_url, language=language)
+            if ctx is not None:
+                return await _heartbeat_t(ctx, call, label="音频转写中")
+            return await call
 
         # 短音频 → qwen3.5-omni 理解。
         if local is not None:
             data = dashscope.data_url(str(local))
         else:
             data = url
-        return await dashscope.chat_audio_omni(
+        call = dashscope.chat_audio_omni(
             client,
             model=config.audio_model(),
             task=task.strip() or DEFAULT_AUDIO_TASK,
             audio_url=data,
         )
+        if ctx is not None:
+            return await _heartbeat_t(ctx, call, label="音频识别中")
+        return await call
 
 
 def _audio_too_long(local) -> bool:
@@ -234,6 +288,7 @@ async def generate_image(
         bool,
         Field(description="必须为 true 才会实际调用付费生成接口；false 时只返回预计费用。"),
     ] = False,
+    ctx: Context | None = None,
 ) -> dict:
     """文生图。生成结果下载到本地输出目录并返回路径（配合 dsh-image-preview 可内联预览）。"""
     tier = tier if tier in config.IMAGE_GEN_MODELS else "standard"
@@ -242,33 +297,39 @@ async def generate_image(
     if not confirm:
         return {"status": "NEEDS_CONFIRMATION", "cost": cost, "note": "设置 confirm=true 后才会实际调用付费生成接口。"}
     model = config.image_generation_model(tier)
-    async with httpx.AsyncClient() as client:
-        urls = await dashscope.generate_image_t2i(
-            client,
-            model=model,
-            prompt=prompt.strip(),
-            size=size,
-        )
-        output_dir = config.generation_output_dir()
-        saved = []
-        previews = []
-        for index, url in enumerate(urls):
-            target = await dashscope.download_to(client, url, output_dir, f"t2i-{index}-{int(time.time())}.png")
-            saved.append(str(target))
-            if config.image_preview_jpeg_enabled():
-                preview = dashscope.make_jpeg_preview(
-                    target,
-                    output_dir,
-                    max_dim=config.image_preview_max_dim(),
-                    quality=config.image_preview_quality(),
-                )
-                if preview is not None:
-                    previews.append(str(preview))
-    result: dict = {"status": "SUCCEEDED", "files": saved, "cost": cost}
-    if previews:
-        result["preview"] = previews[0]
-        result["note"] = "preview 为 JPEG 预览（原图在 files 中）；对话内联显示请用 preview 路径。"
-    return result
+
+    async def _work() -> dict:
+        async with httpx.AsyncClient() as client:
+            urls = await dashscope.generate_image_t2i(
+                client,
+                model=model,
+                prompt=prompt.strip(),
+                size=size,
+            )
+            output_dir = config.generation_output_dir()
+            saved = []
+            previews = []
+            for index, url in enumerate(urls):
+                target = await dashscope.download_to(client, url, output_dir, f"t2i-{index}-{int(time.time())}.png")
+                saved.append(str(target))
+                if config.image_preview_jpeg_enabled():
+                    preview = dashscope.make_jpeg_preview(
+                        target,
+                        output_dir,
+                        max_dim=config.image_preview_max_dim(),
+                        quality=config.image_preview_quality(),
+                    )
+                    if preview is not None:
+                        previews.append(str(preview))
+        result: dict = {"status": "SUCCEEDED", "files": saved, "cost": cost}
+        if previews:
+            result["preview"] = previews[0]
+            result["note"] = "preview 为 JPEG 预览（原图在 files 中）；对话内联显示请用 preview 路径。"
+        return result
+
+    if ctx is not None:
+        return await _heartbeat_t(ctx, _work(), label="文生图生成中")
+    return await _work()
 
 
 async def _run_video_generation(
@@ -280,6 +341,7 @@ async def _run_video_generation(
     wait: bool,
     kind: str,
     image: str | None = None,
+    ctx: Context | None = None,
 ) -> dict:
     tier = tier if tier in config.VIDEO_GEN_MODELS_T2V else "standard"
     if duration < 1 or duration > config.max_video_duration():
@@ -299,39 +361,45 @@ async def _run_video_generation(
         "prompt_extend": True,
         "watermark": False,
     }
-    async with httpx.AsyncClient() as client:
-        if kind == "i2v":
-            if image is None:
-                raise ValueError("图生视频需要提供首帧图片 image")
-            if dashscope.is_remote_url(image) or image.startswith("oss://"):
-                media_url = image
+
+    async def _work() -> dict:
+        async with httpx.AsyncClient() as client:
+            if kind == "i2v":
+                if image is None:
+                    raise ValueError("图生视频需要提供首帧图片 image")
+                if dashscope.is_remote_url(image) or image.startswith("oss://"):
+                    media_url = image
+                else:
+                    media_url = await dashscope.upload_temp_oss(client, model, image)
+                payload = {
+                    "model": model,
+                    "input": {"prompt": prompt.strip(), "media": [{"type": "first_frame", "url": media_url}]},
+                    "parameters": parameters,
+                }
             else:
-                media_url = await dashscope.upload_temp_oss(client, model, image)
-            payload = {
-                "model": model,
-                "input": {"prompt": prompt.strip(), "media": [{"type": "first_frame", "url": media_url}]},
-                "parameters": parameters,
-            }
-        else:
-            payload = {
-                "model": model,
-                "input": {"prompt": prompt.strip()},
-                "parameters": parameters,
-            }
-        if not wait:
-            task_id = await dashscope.submit_video(client, payload=payload)
-            return {"status": "PENDING", "task_id": task_id, "cost": cost}
-        output = await dashscope.submit_video_task(client, payload=payload)
-        video_url = dashscope.video_result_url(output)
-        if not video_url:
-            raise RuntimeError(f"视频任务成功但缺少结果 URL：{str(output)[:300]}")
-        target = await dashscope.download_to(
-            client,
-            video_url,
-            config.generation_output_dir(),
-            f"{'i2v' if kind == 'i2v' else 't2v'}-{int(time.time())}.mp4",
-        )
-        return {"status": "SUCCEEDED", "files": [str(target)], "cost": cost}
+                payload = {
+                    "model": model,
+                    "input": {"prompt": prompt.strip()},
+                    "parameters": parameters,
+                }
+            if not wait:
+                task_id = await dashscope.submit_video(client, payload=payload)
+                return {"status": "PENDING", "task_id": task_id, "cost": cost}
+            output = await dashscope.submit_video_task(client, payload=payload)
+            video_url = dashscope.video_result_url(output)
+            if not video_url:
+                raise RuntimeError(f"视频任务成功但缺少结果 URL：{str(output)[:300]}")
+            target = await dashscope.download_to(
+                client,
+                video_url,
+                config.generation_output_dir(),
+                f"{'i2v' if kind == 'i2v' else 't2v'}-{int(time.time())}.mp4",
+            )
+            return {"status": "SUCCEEDED", "files": [str(target)], "cost": cost}
+
+    if ctx is not None:
+        return await _heartbeat_t(ctx, _work(), label="视频生成中")
+    return await _work()
 
 
 @mcp.tool(
@@ -353,6 +421,7 @@ async def generate_video(
         bool,
         Field(description="必须为 true 才会实际调用付费生成接口；false 时只返回预计费用。"),
     ] = False,
+    ctx: Context | None = None,
 ) -> dict:
     """文生视频。生成结果下载到本地输出目录并返回路径。"""
     tier = tier if tier in config.VIDEO_GEN_MODELS_T2V else "standard"
@@ -361,7 +430,7 @@ async def generate_video(
     if not confirm:
         return {"status": "NEEDS_CONFIRMATION", "cost": cost, "note": "设置 confirm=true 后才会实际调用付费生成接口。"}
     return await _run_video_generation(
-        prompt=prompt, duration=duration, resolution=resolution, tier=tier, wait=wait, kind="t2v"
+        prompt=prompt, duration=duration, resolution=resolution, tier=tier, wait=wait, kind="t2v", ctx=ctx
     )
 
 
@@ -385,6 +454,7 @@ async def generate_video_from_image(
         bool,
         Field(description="必须为 true 才会实际调用付费生成接口；false 时只返回预计费用。"),
     ] = False,
+    ctx: Context | None = None,
 ) -> dict:
     """图生视频：以图片为首帧生成视频。"""
     tier = tier if tier in config.VIDEO_GEN_MODELS_I2V else "standard"
@@ -393,5 +463,5 @@ async def generate_video_from_image(
     if not confirm:
         return {"status": "NEEDS_CONFIRMATION", "cost": cost, "note": "设置 confirm=true 后才会实际调用付费生成接口。"}
     return await _run_video_generation(
-        prompt=prompt, duration=duration, resolution=resolution, tier=tier, wait=wait, kind="i2v", image=image
+        prompt=prompt, duration=duration, resolution=resolution, tier=tier, wait=wait, kind="i2v", image=image, ctx=ctx
     )
