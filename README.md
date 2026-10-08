@@ -42,10 +42,10 @@ API Key 也可用环境变量：`DASH_VISION_API_KEY`（缺省回退 `OMNIMODAL_
 
 ```yaml
 - insert:
-    - id: mcp-vision-dashscope
+    - id: mcp-vision
       name: '@deepseek-ai/dsh-mcp-client'
       config:
-        serverName: vision-dashscope
+        serverName: vision
         transport: stdio
         command: /Users/leeo/.local/bin/uv
         args:
@@ -56,7 +56,7 @@ API Key 也可用环境变量：`DASH_VISION_API_KEY`（缺省回退 `OMNIMODAL_
         failOnStartupError: false
 ```
 
-重启 `dsh web`。连接后工具以 `mcp__vision-dashscope__recognize_video` 等名字出现。
+重启 `dsh web`。连接后工具以 `mcp__vision__recognize_video` 等名字出现。
 
 ## 大文件上传原理（长视频关键）
 
